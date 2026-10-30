@@ -35,6 +35,7 @@ def SessionLocal() -> Session:
             bind=get_engine(),
             autoflush=False,
             autocommit=False,
+            expire_on_commit=False,
             future=True,
         )
     return _SessionLocal()

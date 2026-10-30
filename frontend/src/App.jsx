@@ -220,13 +220,13 @@ export default function App() {
   // Handle Create Employee
   const handleCreateEmployee = async (e) => {
     e.preventDefault();
-    if (!newEmpName) return;
+    if (!newEmpName.trim()) return;
     try {
       const res = await fetch(`${API_BASE}/employees`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
-          employee_name: newEmpName,
+          employee_name: newEmpName.trim(),
           department: newEmpDept,
           role: newEmpRole,
         }),
@@ -238,9 +238,13 @@ export default function App() {
         await loadData();
         setSelectedEmp(created);
         runPipeline(created);
+      } else {
+        const errorData = await res.json().catch(() => ({}));
+        alert(`Failed to add candidate: ${errorData.detail || 'Server error'}`);
       }
     } catch (err) {
       console.error(err);
+      alert('Error connecting to backend server. Please verify backend is running on port 8000.');
     }
   };
 

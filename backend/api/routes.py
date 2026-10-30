@@ -35,7 +35,7 @@ from ..schemas import (
     TrainingTaskUpdate,
 )
 from ..services.audit import log_activity
-from ..services.mock_external_apis import MockEmailAPI, MockHRMS
+from ..services.mock_external_apis import MockEmailAPI, MockHRMS, SYNTHETIC_EMPLOYEES
 
 router = APIRouter(prefix="/api")
 TASK_FLAGS = dict(TASKS)
@@ -53,6 +53,12 @@ def _ensure_employee(
         emp = session.get(Employee, employee_id)
         if emp is None:
             avatar = "".join([part[0].upper() for part in employee_name.split()[:2]]) or "EP"
+            matched_profile = next((e for e in SYNTHETIC_EMPLOYEES if e["department"].lower() == (department or "Engineering").lower()), None)
+            manager_name = matched_profile["manager"] if matched_profile else "Priya Sharma"
+            buddy_name = matched_profile["buddy"] if matched_profile else "Rohan Verma"
+            team_name = matched_profile["team"] if matched_profile else f"{department} Core Team"
+            desk_loc = MockHRMS.get_desk(department)
+
             emp = Employee(
                 employee_id=employee_id,
                 employee_name=employee_name,
@@ -60,7 +66,13 @@ def _ensure_employee(
                 department=department,
                 role=role,
                 joining_date=joining_date or datetime.utcnow().strftime("%Y-%m-%d"),
+                salary="₹18,00,000 CTC",
+                manager=manager_name,
+                buddy=buddy_name,
+                team=team_name,
+                desk=desk_loc,
                 avatar=avatar,
+                avatar_color="#6366f1",
                 onboarding_status="in_progress",
             )
             session.add(emp)
