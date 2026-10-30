@@ -1,0 +1,43 @@
+# Virtual environments
+.venv/
+*/.venv/
+*/*/.venv/
+venv/
+ENV/
+env/
+
+# Node modules
+node_modules/
+*/node_modules/
+*/*/node_modules/
+*/*/*/node_modules/
+
+# Python cache & compiled files
+__pycache__/
+*/__pycache__/
+*/*/__pycache__/
+*/*/*/__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.pytest_cache/
+
+# Databases
+*.db
+*.sqlite3
+
+# Environment files
+.env
+*/.env
+*/*/.env
+!.env.example
+!*/.env.example
+
+# OS and Editor files
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+
+# Large ZIP archives
+*.zip
