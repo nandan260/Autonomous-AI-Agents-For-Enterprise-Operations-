@@ -45,10 +45,6 @@ def it_provisioning_agent(state: AgentState) -> AgentState:
     master_ticket = f"TKT-IT-{uid(6)}"
     audit_log.append(f"  ↳ Master IT Ticket generated: #{master_ticket}")
 
-    # 5. Register Human-in-the-Loop IT Approval Request
-    approval_id = f"APP-IT-{uid(4)}"
-    pending.append(approval_id)
-
     it_summary = {
         "email": email_res,
         "laptop": laptop_res,
@@ -57,41 +53,63 @@ def it_provisioning_agent(state: AgentState) -> AgentState:
     }
 
     session = SessionLocal()
+    is_approved = False
+    approval_id = f"APP-IT-{uid(4)}"
     try:
-        # Save IT Asset Record
-        session.add(
-            ITAssetRecord(
-                employee_id=employee_id,
-                email_account=email_res["email"],
-                laptop_model=laptop_res["spec"]["model"],
-                laptop_specs=json.dumps(laptop_res["spec"]),
-                laptop_ticket_id=laptop_res["ticketId"],
-                master_ticket_id=master_ticket,
-                software_licenses=json.dumps(software_res),
-                status="provisioned_awaiting_approval",
-            )
-        )
+        existing_approval = session.query(ApprovalRequest).filter(
+            ApprovalRequest.employee_id == employee_id,
+            ApprovalRequest.approval_type == "IT Access",
+        ).first()
 
-        # Register HITL Gate
-        approval_req = ApprovalRequest(
-            approval_id=approval_id,
-            employee_id=employee_id,
-            agent="IT Provisioning Agent",
-            approval_type="IT Access",
-            title=f"IT Access & Hardware Sign-Off for {employee_name}",
-            description=(
-                f"IT Manager sign-off required for {employee_name} ({role}, {department}). "
-                f"Hardware: {laptop_res['spec']['model']}. Software: {len(software_res)} licenses."
-            ),
-            checklist=json.dumps([
-                f"Confirm hardware delivery to employee location ({laptop_res['spec']['model']})",
-                "Verify role-appropriate privilege tiers",
-                "Enforce multi-factor authentication (MFA)",
-                "Security training acknowledgment received",
-            ]),
-            status="Pending",
-        )
-        session.add(approval_req)
+        if existing_approval and existing_approval.status == "Approved":
+            is_approved = True
+            approval_id = existing_approval.approval_id
+        elif state.get("it_approved", False):
+            is_approved = True
+            approval_id = existing_approval.approval_id if existing_approval else approval_id
+        else:
+            is_approved = False
+            if existing_approval:
+                approval_id = existing_approval.approval_id
+            else:
+                session.add(
+                    ApprovalRequest(
+                        approval_id=approval_id,
+                        employee_id=employee_id,
+                        agent="IT Provisioning Agent",
+                        approval_type="IT Access",
+                        title=f"IT Access & Hardware Sign-Off for {employee_name}",
+                        description=(
+                            f"IT Manager sign-off required for {employee_name} ({role}, {department}). "
+                            f"Hardware: {laptop_res['spec']['model']}. Software: {len(software_res)} licenses."
+                        ),
+                        checklist=json.dumps([
+                            f"Confirm hardware delivery to employee location ({laptop_res['spec']['model']})",
+                            "Verify role-appropriate privilege tiers",
+                            "Enforce multi-factor authentication (MFA)",
+                            "Security training acknowledgment received",
+                        ]),
+                        status="Pending",
+                    )
+                )
+
+        existing_asset = session.query(ITAssetRecord).filter(ITAssetRecord.employee_id == employee_id).first()
+        if not existing_asset:
+            session.add(
+                ITAssetRecord(
+                    employee_id=employee_id,
+                    email_account=email_res["email"],
+                    laptop_model=laptop_res["spec"]["model"],
+                    laptop_specs=json.dumps(laptop_res["spec"]),
+                    laptop_ticket_id=laptop_res["ticketId"],
+                    master_ticket_id=master_ticket,
+                    software_licenses=json.dumps(software_res),
+                    status="provisioned" if is_approved else "awaiting_approval",
+                )
+            )
+        else:
+            existing_asset.status = "provisioned" if is_approved else "awaiting_approval"
+
         session.commit()
     except Exception as e:
         session.rollback()
@@ -99,18 +117,52 @@ def it_provisioning_agent(state: AgentState) -> AgentState:
     finally:
         session.close()
 
-    log_activity(
-        employee_id,
-        f"IT Access approval gate raised ({approval_id}) for IT Manager review",
-        "IT Provisioning",
-        "gate",
-    )
-    audit_log.append(f"⚠️ HUMAN GATE: IT Manager sign-off required [Request #{approval_id}]")
+    if not is_approved:
+        if approval_id not in pending:
+            pending.append(approval_id)
+        audit_log.append(f"[HITL CHECKPOINT PAUSE] Pipeline paused: IT Manager sign-off required [Request #{approval_id}]")
+        log_activity(
+            employee_id,
+            f"Pipeline paused at IT Gate ({approval_id}): Waiting for IT Manager authorization",
+            "IT Provisioning",
+            "warning",
+        )
+        return {
+            **state,
+            "it_provisioned": False,
+            "is_paused": True,
+            "paused_reason": f"IT Access & Hardware Sign-Off Required for {employee_name}",
+            "active_checkpoint": {
+                "approval_id": approval_id,
+                "agent": "IT Provisioning Agent",
+                "approval_type": "IT Access",
+                "task": "it_provisioning",
+                "title": f"IT Access & Hardware Sign-Off for {employee_name}",
+                "description": f"IT Manager sign-off required for {employee_name} ({role}, {department}). Hardware: {laptop_res['spec']['model']}.",
+                "hardware": laptop_res["spec"]["model"],
+                "software_count": len(software_res),
+                "checklist": [
+                    f"Confirm hardware delivery to employee location ({laptop_res['spec']['model']})",
+                    "Verify role-appropriate privilege tiers",
+                    "Enforce multi-factor authentication (MFA)",
+                    "Security training acknowledgment received",
+                ],
+            },
+            "it_assets": it_summary,
+            "audit_log": audit_log,
+            "pending_approvals": pending,
+        }
 
+    # If approved, proceed cleanly!
+    audit_log.append(f"  ✅ [AUTHORIZED] IT Manager signed off on hardware & licenses [Request #{approval_id}]")
+    log_activity(employee_id, f"IT Access approved ({approval_id})", "IT Provisioning", "success")
     return {
         **state,
         "it_provisioned": True,
+        "is_paused": False,
+        "paused_reason": "",
+        "active_checkpoint": {},
         "it_assets": it_summary,
         "audit_log": audit_log,
-        "pending_approvals": pending,
+        "pending_approvals": [p for p in pending if p != approval_id],
     }

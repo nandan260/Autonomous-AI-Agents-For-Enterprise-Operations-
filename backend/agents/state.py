@@ -39,6 +39,13 @@ class AgentState(TypedDict, total=False):
     audit_log: list
     pending_approvals: list
 
+    # Human-in-the-Loop (HITL) Checkpoint State
+    it_approved: bool
+    team_approved: bool
+    is_paused: bool
+    paused_reason: str
+    active_checkpoint: dict
+
 
 def create_initial_state(
     employee_id: str = "",
@@ -47,6 +54,8 @@ def create_initial_state(
     designation: str = "Software Engineer",
     joining_date: str = "",
     upload_folder: str = "",
+    it_approved: bool = False,
+    team_approved: bool = False,
 ) -> AgentState:
     """Return a complete AgentState with safe defaults."""
     return {
@@ -73,4 +82,9 @@ def create_initial_state(
         "orientation_schedule": {},
         "audit_log": [],
         "pending_approvals": [],
+        "it_approved": it_approved,
+        "team_approved": team_approved,
+        "is_paused": False,
+        "paused_reason": "",
+        "active_checkpoint": {},
     }

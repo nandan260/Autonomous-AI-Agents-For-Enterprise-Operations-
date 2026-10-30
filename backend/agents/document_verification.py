@@ -37,9 +37,34 @@ def document_verification_agent(state: AgentState) -> AgentState:
 
     session = SessionLocal()
     try:
+        from sqlalchemy import select
+
         for doc_name in REQUIRED_DOCS:
-            doc_path = find_document(upload_folder, doc_name)
+            existing_doc = session.scalars(
+                select(DocumentRecord).where(
+                    DocumentRecord.employee_id == employee_id,
+                    DocumentRecord.doc_name == doc_name,
+                )
+            ).first()
+
+            doc_path = find_document(upload_folder, doc_name, employee_id)
             if not doc_path:
+                # If we already have a readable verified record from interactive upload, reuse it
+                if existing_doc and existing_doc.readable and existing_doc.name_match:
+                    doc_issues = json.loads(existing_doc.issues) if existing_doc.issues else []
+                    issues.extend(doc_issues)
+                    results.append({
+                        "document": doc_name,
+                        "document_type": existing_doc.doc_type or "KYC Document",
+                        "readable": True,
+                        "extracted_name": existing_doc.extracted_name,
+                        "name_match": True,
+                        "confidence": existing_doc.confidence or "high",
+                        "llm_used": existing_doc.llm_used,
+                        "issues": doc_issues,
+                    })
+                    continue
+
                 msg = f"Missing document: {doc_name}"
                 issues.append(msg)
                 res = {
@@ -53,19 +78,24 @@ def document_verification_agent(state: AgentState) -> AgentState:
                     "issues": [msg],
                 }
                 results.append(res)
-                session.add(
-                    DocumentRecord(
-                        employee_id=employee_id,
-                        doc_name=doc_name,
-                        doc_type="Unknown",
-                        readable=False,
-                        extracted_name=None,
-                        name_match=False,
-                        confidence="low",
-                        llm_used=False,
-                        issues=json.dumps([msg]),
+                if not existing_doc:
+                    session.add(
+                        DocumentRecord(
+                            employee_id=employee_id,
+                            doc_name=doc_name,
+                            doc_type="Unknown",
+                            readable=False,
+                            extracted_name=None,
+                            name_match=False,
+                            confidence="low",
+                            llm_used=False,
+                            issues=json.dumps([msg]),
+                        )
                     )
-                )
+                else:
+                    existing_doc.readable = False
+                    existing_doc.name_match = False
+                    existing_doc.issues = json.dumps([msg])
                 continue
 
             # OCR Text Extraction
@@ -84,19 +114,24 @@ def document_verification_agent(state: AgentState) -> AgentState:
                     "issues": [msg],
                 }
                 results.append(res)
-                session.add(
-                    DocumentRecord(
-                        employee_id=employee_id,
-                        doc_name=doc_name,
-                        doc_type="Unknown",
-                        readable=False,
-                        extracted_name=None,
-                        name_match=False,
-                        confidence="low",
-                        llm_used=False,
-                        issues=json.dumps([msg]),
+                if not existing_doc:
+                    session.add(
+                        DocumentRecord(
+                            employee_id=employee_id,
+                            doc_name=doc_name,
+                            doc_type="Unknown",
+                            readable=False,
+                            extracted_name=None,
+                            name_match=False,
+                            confidence="low",
+                            llm_used=False,
+                            issues=json.dumps([msg]),
+                        )
                     )
-                )
+                else:
+                    existing_doc.readable = False
+                    existing_doc.name_match = False
+                    existing_doc.issues = json.dumps([msg])
                 continue
 
             # Intelligent LLM / Rule extraction
@@ -116,19 +151,32 @@ def document_verification_agent(state: AgentState) -> AgentState:
             }
             results.append(res)
 
-            session.add(
-                DocumentRecord(
-                    employee_id=employee_id,
-                    doc_name=doc_name,
-                    doc_type=res["document_type"],
-                    readable=True,
-                    extracted_name=res["extracted_name"],
-                    name_match=res["name_match"],
-                    confidence=res["confidence"],
-                    llm_used=res["llm_used"],
-                    issues=json.dumps(doc_issues),
+            meta_json = json.dumps(extraction.get("metadata_fields", {}))
+
+            if not existing_doc:
+                session.add(
+                    DocumentRecord(
+                        employee_id=employee_id,
+                        doc_name=doc_name,
+                        doc_type=res["document_type"],
+                        readable=True,
+                        extracted_name=res["extracted_name"],
+                        name_match=res["name_match"],
+                        confidence=res["confidence"],
+                        llm_used=res["llm_used"],
+                        issues=json.dumps(doc_issues),
+                        metadata_fields=meta_json,
+                    )
                 )
-            )
+            else:
+                existing_doc.doc_type = res["document_type"]
+                existing_doc.readable = True
+                existing_doc.extracted_name = res["extracted_name"]
+                existing_doc.name_match = res["name_match"]
+                existing_doc.confidence = res["confidence"]
+                existing_doc.llm_used = res["llm_used"]
+                existing_doc.issues = json.dumps(doc_issues)
+                existing_doc.metadata_fields = meta_json
 
         passed = len(issues) == 0
         status_tag = "success" if passed else "warning"

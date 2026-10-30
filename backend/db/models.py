@@ -81,6 +81,7 @@ class DocumentRecord(Base):
     confidence = Column(String(20), default="low")
     llm_used = Column(Boolean, default=False)
     issues = Column(Text, nullable=True)  # JSON-serialized list
+    metadata_fields = Column(Text, nullable=True)  # JSON-serialized dict with field-by-field verification
     created_at = Column(DateTime, default=datetime.utcnow)
 
 

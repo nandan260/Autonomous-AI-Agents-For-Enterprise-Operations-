@@ -61,29 +61,70 @@ def _run_node_wrapper(task_id: str, agent_fn):
     def node(state: AgentState) -> AgentState:
         updated = agent_fn(state)
         audit_log = list(updated.get("audit_log") or [])
-        audit_log.append(f"[Orchestrator] Completed stage: {task_id}")
+        if updated.get("is_paused"):
+            audit_log.append(f"[Orchestrator] Paused at stage: {task_id}")
+        else:
+            audit_log.append(f"[Orchestrator] Completed stage: {task_id}")
         return {**updated, "audit_log": audit_log}
     return node
 
 
+def check_it_gate(state: AgentState) -> str:
+    if state.get("is_paused") or not state.get("it_provisioned"):
+        return "pause_checkpoint"
+    return TEAM_ALLOCATION
+
+
+def check_team_gate(state: AgentState) -> str:
+    if state.get("is_paused") or not state.get("team_allocated"):
+        return "pause_checkpoint"
+    return TRAINING
+
+
+def pause_checkpoint_node(state: AgentState) -> AgentState:
+    audit_log = list(state.get("audit_log") or [])
+    reason = state.get("paused_reason", "Awaiting Human Authorization")
+    audit_log.append(f"⏸️ [Orchestrator] Pipeline paused at Human Checkpoint: {reason}")
+    return {**state, "audit_log": audit_log}
+
+
 def build_orchestrator_graph():
-    """Build LangGraph workflow pipeline with sequential fallback routing."""
+    """Build LangGraph workflow pipeline with active Human-in-the-Loop conditional pausing."""
     workflow = StateGraph(AgentState)
 
     workflow.add_node("start_orchestrator", receive_onboarding)
     workflow.add_node(DOCUMENT_VERIFICATION, _run_node_wrapper(DOCUMENT_VERIFICATION, document_verification_agent))
     workflow.add_node(IT_PROVISIONING, _run_node_wrapper(IT_PROVISIONING, it_provisioning_agent))
+    workflow.add_node("pause_checkpoint", pause_checkpoint_node)
     workflow.add_node(TEAM_ALLOCATION, _run_node_wrapper(TEAM_ALLOCATION, team_allocation_agent))
     workflow.add_node(TRAINING, _run_node_wrapper(TRAINING, training_agent))
     workflow.add_node(FINALIZE, track_tasks)
     workflow.add_node("monitoring", monitoring_agent)
 
-    # Workflow Edges: sequential execution pipeline across all specialized agents
+    # Workflow Edges: sequential execution pipeline with HITL pausing checkpoints
     workflow.add_edge(START, "start_orchestrator")
     workflow.add_edge("start_orchestrator", DOCUMENT_VERIFICATION)
     workflow.add_edge(DOCUMENT_VERIFICATION, IT_PROVISIONING)
-    workflow.add_edge(IT_PROVISIONING, TEAM_ALLOCATION)
-    workflow.add_edge(TEAM_ALLOCATION, TRAINING)
+
+    workflow.add_conditional_edges(
+        IT_PROVISIONING,
+        check_it_gate,
+        {
+            "pause_checkpoint": "pause_checkpoint",
+            TEAM_ALLOCATION: TEAM_ALLOCATION,
+        },
+    )
+
+    workflow.add_conditional_edges(
+        TEAM_ALLOCATION,
+        check_team_gate,
+        {
+            "pause_checkpoint": "pause_checkpoint",
+            TRAINING: TRAINING,
+        },
+    )
+
+    workflow.add_edge("pause_checkpoint", "monitoring")
     workflow.add_edge(TRAINING, FINALIZE)
     workflow.add_edge(FINALIZE, "monitoring")
     workflow.add_edge("monitoring", END)
@@ -98,8 +139,38 @@ def run_onboarding(
     designation: str = "Software Engineer",
     joining_date: str = "",
     upload_folder: str = "",
+    it_approved: bool | None = None,
+    team_approved: bool | None = None,
 ) -> AgentState:
-    """Entry point: execute the full multi-agent onboarding graph."""
+    """Entry point: execute the multi-agent onboarding graph with active human pausing."""
+    from ..db.session import SessionLocal
+    from ..db.models import ApprovalRequest
+
+    session = SessionLocal()
+    try:
+        if it_approved is None:
+            it_app = session.query(ApprovalRequest).filter(
+                ApprovalRequest.employee_id == employee_id,
+                ApprovalRequest.approval_type == "IT Access",
+                ApprovalRequest.status == "Approved",
+            ).first()
+            it_approved = it_app is not None
+
+        if team_approved is None:
+            team_app = session.query(ApprovalRequest).filter(
+                ApprovalRequest.employee_id == employee_id,
+                ApprovalRequest.approval_type == "Team Allocation",
+                ApprovalRequest.status == "Approved",
+            ).first()
+            team_approved = team_app is not None
+    except Exception:
+        if it_approved is None:
+            it_approved = False
+        if team_approved is None:
+            team_approved = False
+    finally:
+        session.close()
+
     graph = build_orchestrator_graph()
     initial_state = create_initial_state(
         employee_id=employee_id,
@@ -108,5 +179,7 @@ def run_onboarding(
         designation=designation,
         joining_date=joining_date,
         upload_folder=upload_folder,
+        it_approved=it_approved,
+        team_approved=team_approved,
     )
     return graph.invoke(initial_state)

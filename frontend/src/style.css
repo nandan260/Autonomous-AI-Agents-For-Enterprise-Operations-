@@ -603,3 +603,133 @@ tr:hover td {
   .pipeline-bar { flex-wrap: wrap; gap: 16px; }
   .pipeline-line { display: none; }
 }
+
+/* ── Human-in-the-Loop Active Pausing & Checkpoint Banner ── */
+.hitl-checkpoint-banner {
+  margin-top: 24px;
+  background: linear-gradient(135deg, rgba(245, 158, 11, 0.08) 0%, rgba(217, 119, 6, 0.12) 100%);
+  border: 1.5px solid rgba(245, 158, 11, 0.4);
+  border-radius: 14px;
+  padding: 22px;
+  box-shadow: 0 8px 30px rgba(245, 158, 11, 0.15);
+  animation: hitl-pulse 2.5s infinite ease-in-out;
+}
+
+@keyframes hitl-pulse {
+  0%, 100% { border-color: rgba(245, 158, 11, 0.4); box-shadow: 0 0 20px rgba(245, 158, 11, 0.15); }
+  50% { border-color: rgba(245, 158, 11, 0.85); box-shadow: 0 0 35px rgba(245, 158, 11, 0.3); }
+}
+
+.hitl-checkpoint-top {
+  display: flex;
+  justify-content: space-between;
+  align-items: flex-start;
+  flex-wrap: wrap;
+  gap: 12px;
+}
+
+.hitl-pulsing-badge {
+  background: rgba(245, 158, 11, 0.2);
+  border: 1px solid rgba(245, 158, 11, 0.5);
+  border-radius: 10px;
+  padding: 8px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+
+.hitl-badge-label {
+  font-size: 11px;
+  font-weight: 800;
+  letter-spacing: 0.08em;
+  color: #f59e0b;
+}
+
+.hitl-tag {
+  background: rgba(245, 158, 11, 0.15);
+  color: #fbbf24;
+  border: 1px solid rgba(245, 158, 11, 0.3);
+  padding: 4px 10px;
+  border-radius: 20px;
+  font-size: 12px;
+  font-family: monospace;
+}
+
+.hitl-checklist-box {
+  background: rgba(0, 0, 0, 0.3);
+  border: 1px solid rgba(255, 255, 255, 0.08);
+  border-radius: 10px;
+  padding: 14px 16px;
+  margin: 16px 0;
+}
+
+.hitl-check-item {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  font-size: 13px;
+  color: #e2e8f0;
+  margin-bottom: 6px;
+}
+
+.hitl-check-item:last-child {
+  margin-bottom: 0;
+}
+
+.hitl-action-footer {
+  display: flex;
+  justify-content: flex-end;
+  gap: 12px;
+  margin-top: 18px;
+  flex-wrap: wrap;
+}
+
+.hitl-approve-btn {
+  background: linear-gradient(135deg, #10b981 0%, #059669 100%) !important;
+  color: white !important;
+  font-weight: 600 !important;
+  padding: 10px 20px !important;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  border: none !important;
+  box-shadow: 0 4px 15px rgba(16, 185, 129, 0.3) !important;
+}
+
+.hitl-approve-btn:hover {
+  background: linear-gradient(135deg, #059669 0%, #047857 100%) !important;
+  transform: translateY(-1px);
+}
+
+.hitl-reject-btn {
+  background: rgba(239, 68, 68, 0.1) !important;
+  color: #ef4444 !important;
+  border: 1px solid rgba(239, 68, 68, 0.3) !important;
+}
+
+.hitl-reject-btn:hover {
+  background: rgba(239, 68, 68, 0.2) !important;
+}
+
+.hitl-success-banner {
+  margin-top: 24px;
+  background: linear-gradient(135deg, rgba(16, 185, 129, 0.1) 0%, rgba(5, 150, 105, 0.15) 100%);
+  border: 1.5px solid rgba(16, 185, 129, 0.5);
+  border-radius: 14px;
+  padding: 18px 22px;
+  display: flex;
+  align-items: center;
+  gap: 16px;
+}
+
+.pipeline-step.paused .step-circle {
+  border-color: #f59e0b !important;
+  color: #f59e0b !important;
+  background: rgba(245, 158, 11, 0.15) !important;
+  animation: hitl-step-pulse 1.8s infinite ease-in-out;
+}
+
+@keyframes hitl-step-pulse {
+  0%, 100% { transform: scale(1); box-shadow: 0 0 10px rgba(245, 158, 11, 0.3); }
+  50% { transform: scale(1.1); box-shadow: 0 0 20px rgba(245, 158, 11, 0.7); }
+}

@@ -20,7 +20,8 @@ import {
   Building2,
   Mail,
   Compass,
-  ArrowRight
+  ArrowRight,
+  Download
 } from 'lucide-react';
 import './style.css';
 
@@ -40,6 +41,7 @@ export default function App() {
   const [pipelineRunning, setPipelineRunning] = useState(false);
   const [pipelineLogs, setPipelineLogs] = useState([]);
   const [pipelineStage, setPipelineStage] = useState(0);
+  const [activeCheckpoint, setActiveCheckpoint] = useState(null);
 
   // New Employee Form State
   const [newEmpName, setNewEmpName] = useState('');
@@ -47,6 +49,16 @@ export default function App() {
   const [newEmpRole, setNewEmpRole] = useState('Software Engineer');
   const [showAddModal, setShowAddModal] = useState(false);
   const [uploadStatus, setUploadStatus] = useState('');
+
+  // Interactive Checkpoint Configuration States
+  const [selectedHardware, setSelectedHardware] = useState('MacBook Pro 14" M3 Pro');
+  const [assetTagInput, setAssetTagInput] = useState('ASSET-2024-9182');
+  const [privilegeTier, setPrivilegeTier] = useState('Developer Privileged (MFA Enforced)');
+  const [selectedTeam, setSelectedTeam] = useState('Platform Engineering');
+  const [selectedManager, setSelectedManager] = useState('Kiran Rao');
+  const [selectedBuddy, setSelectedBuddy] = useState('Ananya Singh');
+  const [deskInput, setDeskInput] = useState('Floor 4, Tech Wing, Desk #ENG-402');
+  const [workMode, setWorkMode] = useState('Hybrid (3 Days Office)');
 
   // Initial Data Fetching
   const loadData = async () => {
@@ -86,9 +98,10 @@ export default function App() {
   // Fetch employee specific details when selectedEmp changes
   useEffect(() => {
     if (!selectedEmp) return;
+    const empId = selectedEmp.employee_id || selectedEmp.id;
     const fetchDetails = async () => {
       try {
-        const res = await fetch(`${API_BASE}/employees/${selectedEmp.employee_id || selectedEmp.id}`);
+        const res = await fetch(`${API_BASE}/employees/${empId}`);
         if (res.ok) {
           const data = await res.json();
           setEmpDetail(data);
@@ -96,10 +109,28 @@ export default function App() {
           setDocuments(data.documents || []);
         }
 
-        const logRes = await fetch(`${API_BASE}/onboarding/${selectedEmp.employee_id || selectedEmp.id}/logs`);
+        const logRes = await fetch(`${API_BASE}/onboarding/${empId}/logs`);
         if (logRes.ok) {
           const ldata = await logRes.json();
           setAuditLogs(ldata.logs || []);
+        }
+
+        // Check if employee has an active pending checkpoint
+        const appRes = await fetch(`${API_BASE}/approvals?status=Pending`);
+        if (appRes.ok) {
+          const pendingList = await appRes.json();
+          const match = pendingList.find((a) => a.employee_id === empId);
+          if (match) {
+            setActiveCheckpoint(match);
+            if (match.approval_type === 'IT Access') {
+              setPipelineStage(3);
+            } else if (match.approval_type === 'Team Allocation') {
+              setPipelineStage(4);
+            }
+          } else if (selectedEmp.onboarding_status === 'completed') {
+            setPipelineStage(6);
+            setActiveCheckpoint(null);
+          }
         }
       } catch (err) {
         console.error(err);
@@ -108,12 +139,13 @@ export default function App() {
     fetchDetails();
   }, [selectedEmp]);
 
-  // Run End-to-End Pipeline
+  // Run End-to-End Pipeline with Active Human-in-the-Loop Checkpoint Pausing
   const runPipeline = async (emp) => {
     const target = emp || selectedEmp || employees[0];
     if (!target) return;
     setPipelineRunning(true);
     setPipelineStage(1);
+    setActiveCheckpoint(null);
     setPipelineLogs([
       `[Supervisor Orchestrator] Initializing onboarding workflow for ${target.employee_name || target.name}...`,
     ]);
@@ -134,17 +166,31 @@ export default function App() {
 
       if (res.ok) {
         const result = await res.json();
-        // Simulate step progression for rich UX
+        // Step 1: Start -> Step 2: OCR & Doc check
         setTimeout(() => setPipelineStage(2), 600);
-        setTimeout(() => setPipelineStage(3), 1200);
-        setTimeout(() => setPipelineStage(4), 1800);
-        setTimeout(() => setPipelineStage(5), 2400);
+
+        // Step 2 -> Step 3: IT Provisioning
         setTimeout(() => {
-          setPipelineStage(6);
           setPipelineLogs(result.audit_trail || []);
-          setPipelineRunning(false);
-          loadData();
-        }, 3000);
+          setPipelineStage(3);
+
+          if (result.is_paused) {
+            // HALT ON SCREEN! Do NOT proceed until human authorizes!
+            setPipelineRunning(false);
+            setActiveCheckpoint(result.active_checkpoint);
+            loadData();
+          } else {
+            // If already authorized, continue through remaining steps
+            setTimeout(() => setPipelineStage(4), 600);
+            setTimeout(() => setPipelineStage(5), 1200);
+            setTimeout(() => {
+              setPipelineStage(6);
+              setPipelineRunning(false);
+              setActiveCheckpoint(null);
+              loadData();
+            }, 1800);
+          }
+        }, 1300);
       } else {
         setPipelineRunning(false);
       }
@@ -154,19 +200,53 @@ export default function App() {
     }
   };
 
-  // Handle Approvals
-  const handleApprovalAction = async (approvalId, action) => {
+  // Handle Approvals with automatic workflow resumption
+  const handleApprovalAction = async (approvalId, action, customData = {}) => {
     try {
+      setPipelineRunning(true);
       const res = await fetch(`${API_BASE}/approvals/${approvalId}/action`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ action, approver: 'HR Supervisor', notes: `Actioned as ${action}` }),
+        body: JSON.stringify({
+          action,
+          approver: customData.approver || 'HR / IT Governance Lead',
+          notes: customData.notes || `Human intervention actioned as ${action}`,
+          ...customData
+        }),
       });
       if (res.ok) {
-        loadData();
+        const data = await res.json();
+        await loadData();
+
+        if (data.pipeline) {
+          const pipe = data.pipeline;
+          setPipelineLogs(pipe.audit_trail || []);
+
+          if (pipe.is_paused) {
+            // Advanced to next stage, but paused at the subsequent Checkpoint (e.g. Stage 4 Manager Sign-off)
+            setPipelineStage(4);
+            setActiveCheckpoint(pipe.active_checkpoint);
+            setPipelineRunning(false);
+          } else {
+            // Pipeline reached 100% completion!
+            setPipelineStage(5);
+            setTimeout(() => {
+              setPipelineStage(6);
+              setActiveCheckpoint(null);
+              setPipelineRunning(false);
+              loadData();
+            }, 900);
+          }
+        } else {
+          setActiveCheckpoint(null);
+          setPipelineRunning(false);
+        }
+      } else {
+        setPipelineRunning(false);
       }
     } catch (e) {
       console.error(e);
+      setPipelineRunning(false);
     }
   };
 
@@ -190,30 +270,93 @@ export default function App() {
     }
   };
 
-  // Handle File Upload
-  const handleFileUpload = async (e) => {
-    const file = e.target.files[0];
-    if (!file) return;
-    setUploadStatus(`Uploading ${file.name}...`);
-    const formData = new FormData();
-    formData.append('file', file);
-    if (selectedEmp) {
-      formData.append('employee_id', selectedEmp.employee_id || selectedEmp.id);
+  // Handle File Upload (Single or Batch Multi-file)
+  const handleFileUpload = async (files, docType = 'auto') => {
+    const fileList = files instanceof FileList || Array.isArray(files) ? Array.from(files) : (files ? [files] : []);
+    if (fileList.length === 0) return;
+
+    if (!selectedEmp) {
+      alert('Please select a candidate first.');
+      return;
     }
+    const empId = selectedEmp.employee_id || selectedEmp.id;
+    setUploadStatus(`Uploading & verifying ${fileList.length} document(s)...`);
+
+    const formData = new FormData();
+    fileList.forEach((f) => formData.append('files', f));
+    formData.append('employee_id', empId);
+    formData.append('doc_type', docType);
+
     try {
       const res = await fetch(`${API_BASE}/documents/upload`, {
         method: 'POST',
         body: formData,
       });
       if (res.ok) {
-        setUploadStatus(`Successfully uploaded ${file.name}. Triggering verification...`);
-        setTimeout(() => {
-          runPipeline(selectedEmp);
-          setUploadStatus('');
-        }, 1200);
+        const data = await res.json();
+        setDocuments(data.documents || []);
+        setUploadStatus(`Successfully processed ${fileList.length} document(s) with PyMuPDF OCR & LLM!`);
+        await loadData();
+        setTimeout(() => setUploadStatus(''), 4500);
+      } else {
+        const errData = await res.json().catch(() => ({}));
+        setUploadStatus(`Upload error: ${errData.detail || 'Server error'}`);
       }
     } catch (err) {
+      console.error(err);
       setUploadStatus('Upload failed. Check backend connection.');
+    }
+  };
+
+  // Auto-Generate Authentic KYC Documents Pack for Selected Candidate
+  const handleGenerateDemoDocs = async () => {
+    if (!selectedEmp) {
+      alert('Please select a candidate first.');
+      return;
+    }
+    const empId = selectedEmp.employee_id || selectedEmp.id;
+    const empName = selectedEmp.employee_name || selectedEmp.name;
+    setUploadStatus(`Generating authentic KYC document suite for ${empName}...`);
+    try {
+      const res = await fetch(`${API_BASE}/documents/${empId}/generate-demo-pack`, {
+        method: 'POST',
+      });
+      if (res.ok) {
+        const data = await res.json();
+        setDocuments(data || []);
+        setUploadStatus(`All 4 KYC documents generated & verified with PyMuPDF OCR for ${empName}!`);
+        await loadData();
+        setTimeout(() => setUploadStatus(''), 5000);
+      } else {
+        setUploadStatus('Failed to generate demo documents.');
+      }
+    } catch (err) {
+      console.error(err);
+      setUploadStatus('Error connecting to backend server.');
+    }
+  };
+
+  // Handle HR Sign-off Override on Flagged Document
+  const handleHROverride = async (docId) => {
+    if (!docId) return;
+    try {
+      const res = await fetch(`${API_BASE}/documents/${docId}/hr-override`, {
+        method: 'POST',
+      });
+      if (res.ok) {
+        const data = await res.json();
+        setDocuments((prev) =>
+          prev.map((d) => (d.id === docId ? data.document : d))
+        );
+        setUploadStatus('Document manually verified and approved via HR Sign-Off!');
+        await loadData();
+        setTimeout(() => setUploadStatus(''), 4500);
+      } else {
+        alert('Failed to apply HR sign-off override.');
+      }
+    } catch (err) {
+      console.error(err);
+      alert('Error connecting to backend server.');
     }
   };
 
@@ -601,20 +744,48 @@ export default function App() {
 
                 <div
                   className={`pipeline-step ${
-                    pipelineStage === 3 ? 'active' : pipelineStage > 3 ? 'completed' : ''
+                    activeCheckpoint && (activeCheckpoint.approval_type === 'IT Access' || activeCheckpoint.task === 'it_provisioning')
+                      ? 'paused'
+                      : pipelineStage === 3
+                      ? 'active'
+                      : pipelineStage > 3
+                      ? 'completed'
+                      : ''
                   }`}
                 >
-                  <div className="step-circle">3</div>
-                  <div className="step-label">IT Provisioning</div>
+                  <div className="step-circle">
+                    {activeCheckpoint && (activeCheckpoint.approval_type === 'IT Access' || activeCheckpoint.task === 'it_provisioning')
+                      ? '⏸️'
+                      : '3'}
+                  </div>
+                  <div className="step-label">
+                    {activeCheckpoint && (activeCheckpoint.approval_type === 'IT Access' || activeCheckpoint.task === 'it_provisioning')
+                      ? 'IT Gate (Paused)'
+                      : 'IT Provisioning'}
+                  </div>
                 </div>
 
                 <div
                   className={`pipeline-step ${
-                    pipelineStage === 4 ? 'active' : pipelineStage > 4 ? 'completed' : ''
+                    activeCheckpoint && (activeCheckpoint.approval_type === 'Team Allocation' || activeCheckpoint.task === 'team_allocation')
+                      ? 'paused'
+                      : pipelineStage === 4
+                      ? 'active'
+                      : pipelineStage > 4
+                      ? 'completed'
+                      : ''
                   }`}
                 >
-                  <div className="step-circle">4</div>
-                  <div className="step-label">Team Allocation</div>
+                  <div className="step-circle">
+                    {activeCheckpoint && (activeCheckpoint.approval_type === 'Team Allocation' || activeCheckpoint.task === 'team_allocation')
+                      ? '⏸️'
+                      : '4'}
+                  </div>
+                  <div className="step-label">
+                    {activeCheckpoint && (activeCheckpoint.approval_type === 'Team Allocation' || activeCheckpoint.task === 'team_allocation')
+                      ? 'Manager Gate (Paused)'
+                      : 'Team Allocation'}
+                  </div>
                 </div>
 
                 <div
@@ -631,6 +802,198 @@ export default function App() {
                   <div className="step-label">Finished</div>
                 </div>
               </div>
+
+              {/* ── Active Human-in-the-Loop Checkpoint Intervention Banner ── */}
+              {activeCheckpoint && (
+                <div className="hitl-checkpoint-banner">
+                  <div className="hitl-checkpoint-top">
+                    <div style={{ display: 'flex', alignItems: 'center', gap: '12px' }}>
+                      <div className="hitl-pulsing-badge">
+                        <ShieldAlert size={22} color="#f59e0b" />
+                      </div>
+                      <div>
+                        <div className="hitl-badge-label">
+                          HUMAN INTERVENTION REQUIRED · PIPELINE PAUSED
+                        </div>
+                        <h4 style={{ margin: '4px 0 0 0', fontSize: '16px', color: 'white' }}>
+                          {activeCheckpoint.title}
+                        </h4>
+                      </div>
+                    </div>
+                    <span className="hitl-tag">
+                      Checkpoint ID: {activeCheckpoint.approval_id}
+                    </span>
+                  </div>
+
+                  <p style={{ margin: '12px 0', fontSize: '13.5px', color: 'var(--text-muted)' }}>
+                    {activeCheckpoint.description}
+                  </p>
+
+                  {/* Interactive IT Provisioning Controls */}
+                  {(activeCheckpoint.task === 'it_provisioning' || activeCheckpoint.approval_type === 'IT Access') && (
+                    <div style={{ margin: '14px 0', padding: '12px 14px', background: 'rgba(15, 23, 42, 0.75)', borderRadius: '8px', border: '1px solid rgba(59, 130, 246, 0.3)' }}>
+                      <div style={{ fontSize: '12px', fontWeight: 600, color: '#38bdf8', marginBottom: '10px' }}>
+                        ⚙️ CONFIGURE IT PROVISIONING ASSETS & SECURITY TIERS:
+                      </div>
+                      <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '10px', marginBottom: '10px' }}>
+                        <div>
+                          <label style={{ fontSize: '11px', color: 'var(--text-muted)', display: 'block', marginBottom: '4px' }}>Hardware Model</label>
+                          <select
+                            value={selectedHardware}
+                            onChange={(e) => setSelectedHardware(e.target.value)}
+                            style={{ width: '100%', padding: '6px 10px', background: 'var(--card-bg)', color: 'white', border: '1px solid var(--card-border)', borderRadius: '6px', fontSize: '12px' }}
+                          >
+                            <option value='MacBook Pro 16" M3 Max (36GB, 1TB SSD)'>MacBook Pro 16" M3 Max (36GB, 1TB SSD)</option>
+                            <option value='MacBook Pro 14" M3 Pro (18GB, 512GB SSD)'>MacBook Pro 14" M3 Pro (18GB, 512GB SSD)</option>
+                            <option value='MacBook Air 15" M2 (16GB, 512GB SSD)'>MacBook Air 15" M2 (16GB, 512GB SSD)</option>
+                            <option value="Lenovo ThinkPad X1 Carbon Gen 12 (32GB, 1TB)">Lenovo ThinkPad X1 Carbon Gen 12 (32GB, 1TB)</option>
+                            <option value="Dell Precision 5680 Workstation (64GB, 2TB)">Dell Precision 5680 Workstation (64GB, 2TB)</option>
+                          </select>
+                        </div>
+                        <div>
+                          <label style={{ fontSize: '11px', color: 'var(--text-muted)', display: 'block', marginBottom: '4px' }}>Asset Tag & Serial #</label>
+                          <input
+                            type="text"
+                            value={assetTagInput}
+                            onChange={(e) => setAssetTagInput(e.target.value)}
+                            style={{ width: '100%', padding: '6px 10px', background: 'var(--card-bg)', color: 'white', border: '1px solid var(--card-border)', borderRadius: '6px', fontSize: '12px' }}
+                          />
+                        </div>
+                      </div>
+                      <div>
+                        <label style={{ fontSize: '11px', color: 'var(--text-muted)', display: 'block', marginBottom: '4px' }}>Access Privilege Tier</label>
+                        <select
+                          value={privilegeTier}
+                          onChange={(e) => setPrivilegeTier(e.target.value)}
+                          style={{ width: '100%', padding: '6px 10px', background: 'var(--card-bg)', color: 'white', border: '1px solid var(--card-border)', borderRadius: '6px', fontSize: '12px' }}
+                        >
+                          <option value="Developer Privileged (MFA Enforced)">Developer Privileged (MFA Enforced)</option>
+                          <option value="Standard Business User">Standard Business User</option>
+                          <option value="Cloud Infrastructure Admin (Zero Trust)">Cloud Infrastructure Admin (Zero Trust)</option>
+                        </select>
+                      </div>
+                    </div>
+                  )}
+
+                  {/* Interactive Team Allocation Controls */}
+                  {(activeCheckpoint.task === 'team_allocation' || activeCheckpoint.approval_type === 'Team Allocation') && (
+                    <div style={{ margin: '14px 0', padding: '12px 14px', background: 'rgba(15, 23, 42, 0.75)', borderRadius: '8px', border: '1px solid rgba(16, 185, 129, 0.3)' }}>
+                      <div style={{ fontSize: '12px', fontWeight: 600, color: '#34d399', marginBottom: '10px' }}>
+                        👥 CONFIGURE SQUAD PLACEMENT & BUDDY ALLOCATION:
+                      </div>
+                      <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '10px', marginBottom: '10px' }}>
+                        <div>
+                          <label style={{ fontSize: '11px', color: 'var(--text-muted)', display: 'block', marginBottom: '4px' }}>Assigned Squad / Team</label>
+                          <select
+                            value={selectedTeam}
+                            onChange={(e) => setSelectedTeam(e.target.value)}
+                            style={{ width: '100%', padding: '6px 10px', background: 'var(--card-bg)', color: 'white', border: '1px solid var(--card-border)', borderRadius: '6px', fontSize: '12px' }}
+                          >
+                            <option value="Platform Engineering">Platform Engineering</option>
+                            <option value="Core Infrastructure">Core Infrastructure</option>
+                            <option value="Product Experience">Product Experience</option>
+                            <option value="Billing & Payments">Billing & Payments</option>
+                          </select>
+                        </div>
+                        <div>
+                          <label style={{ fontSize: '11px', color: 'var(--text-muted)', display: 'block', marginBottom: '4px' }}>Assigned Peer Buddy</label>
+                          <select
+                            value={selectedBuddy}
+                            onChange={(e) => setSelectedBuddy(e.target.value)}
+                            style={{ width: '100%', padding: '6px 10px', background: 'var(--card-bg)', color: 'white', border: '1px solid var(--card-border)', borderRadius: '6px', fontSize: '12px' }}
+                          >
+                            <option value="Ananya Singh (Staff Engineer)">Ananya Singh (Staff Engineer)</option>
+                            <option value="Rohan Verma (Principal Architect)">Rohan Verma (Principal Architect)</option>
+                            <option value="Divya Nair (Tech Lead)">Divya Nair (Tech Lead)</option>
+                          </select>
+                        </div>
+                      </div>
+                      <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '10px' }}>
+                        <div>
+                          <label style={{ fontSize: '11px', color: 'var(--text-muted)', display: 'block', marginBottom: '4px' }}>Work Mode</label>
+                          <select
+                            value={workMode}
+                            onChange={(e) => setWorkMode(e.target.value)}
+                            style={{ width: '100%', padding: '6px 10px', background: 'var(--card-bg)', color: 'white', border: '1px solid var(--card-border)', borderRadius: '6px', fontSize: '12px' }}
+                          >
+                            <option value="Hybrid (3 Days Office)">Hybrid (3 Days Office)</option>
+                            <option value="Full Remote">Full Remote</option>
+                            <option value="Onsite Bengaluru HQ">Onsite Bengaluru HQ</option>
+                          </select>
+                        </div>
+                        <div>
+                          <label style={{ fontSize: '11px', color: 'var(--text-muted)', display: 'block', marginBottom: '4px' }}>Office Desk Location</label>
+                          <input
+                            type="text"
+                            value={deskInput}
+                            onChange={(e) => setDeskInput(e.target.value)}
+                            style={{ width: '100%', padding: '6px 10px', background: 'var(--card-bg)', color: 'white', border: '1px solid var(--card-border)', borderRadius: '6px', fontSize: '12px' }}
+                          />
+                        </div>
+                      </div>
+                    </div>
+                  )}
+
+                  {activeCheckpoint.checklist && activeCheckpoint.checklist.length > 0 && (
+                    <div className="hitl-checklist-box">
+                      <div style={{ fontSize: '12px', fontWeight: 600, color: 'var(--text-muted)', marginBottom: '8px' }}>
+                        REQUIRED SAFETY & COMPLIANCE CHECKS:
+                      </div>
+                      {activeCheckpoint.checklist.map((item, idx) => (
+                        <div key={idx} className="hitl-check-item">
+                          <CheckCircle2 size={15} color="#10b981" />
+                          <span>{item}</span>
+                        </div>
+                      ))}
+                    </div>
+                  )}
+
+                  <div className="hitl-action-footer">
+                    <button
+                      className="btn-primary hitl-approve-btn"
+                      onClick={() => {
+                        const isIT = activeCheckpoint.task === 'it_provisioning' || activeCheckpoint.approval_type === 'IT Access';
+                        const payload = isIT ? {
+                          laptop_model: selectedHardware,
+                          asset_tag: assetTagInput,
+                          privilege_tier: privilegeTier,
+                        } : {
+                          assigned_team: selectedTeam,
+                          reporting_manager: selectedManager,
+                          peer_buddy: selectedBuddy,
+                          desk_location: deskInput,
+                          work_mode: workMode,
+                        };
+                        handleApprovalAction(activeCheckpoint.approval_id, 'Approved', payload);
+                      }}
+                    >
+                      <UserCheck size={16} />
+                      Authorize & Proceed to Next Agent →
+                    </button>
+                    <button
+                      className="btn-secondary hitl-reject-btn"
+                      onClick={() => handleApprovalAction(activeCheckpoint.approval_id, 'Rejected')}
+                    >
+                      Reject Request
+                    </button>
+                  </div>
+                </div>
+              )}
+
+              {/* ── Finished Celebration Banner ── */}
+              {pipelineStage >= 6 && !activeCheckpoint && (
+                <div className="hitl-success-banner">
+                  <CheckCircle2 size={24} color="#10b981" />
+                  <div>
+                    <strong style={{ display: 'block', fontSize: '15px', color: 'white' }}>
+                      Onboarding Fully Completed with Human Governance!
+                    </strong>
+                    <span style={{ fontSize: '13px', color: 'var(--text-muted)' }}>
+                      All AI agent proposals were verified and authorized by human approvers.
+                    </span>
+                  </div>
+                </div>
+              )}
 
               {/* Live Console Output */}
               <div style={{ marginTop: '24px' }}>
@@ -778,29 +1141,94 @@ export default function App() {
                   <h3>Document Verification Hub (PyMuPDF OCR + Gemini LLM)</h3>
                   <p className="panel-sub" style={{ margin: 0 }}>
                     Viewing verification results for:{' '}
-                    <strong>{selectedEmp?.employee_name || selectedEmp?.name}</strong>
+                    <strong>{selectedEmp?.employee_name || selectedEmp?.name || 'No Candidate Selected'}</strong>
                   </p>
+                </div>
+                <div style={{ display: 'flex', gap: '10px', alignItems: 'center' }}>
+                  <select
+                    style={{
+                      background: 'var(--card-bg)',
+                      color: 'white',
+                      border: '1px solid var(--card-border)',
+                      padding: '8px 12px',
+                      borderRadius: '8px',
+                      fontSize: '13px',
+                    }}
+                    value={selectedEmp?.employee_id || selectedEmp?.id || ''}
+                    onChange={(e) => {
+                      const found = employees.find(
+                        (emp) => (emp.employee_id || emp.id) === e.target.value
+                      );
+                      if (found) setSelectedEmp(found);
+                    }}
+                  >
+                    {employees.map((e) => (
+                      <option key={e.employee_id || e.id} value={e.employee_id || e.id}>
+                        {e.employee_name || e.name} ({e.department})
+                      </option>
+                    ))}
+                  </select>
+                  <button
+                    className="btn-primary"
+                    onClick={handleGenerateDemoDocs}
+                    style={{ display: 'flex', alignItems: 'center', gap: '6px', fontSize: '13px' }}
+                  >
+                    <FileCheck size={15} />
+                    ⚡ Auto-Generate All 4 KYC Docs
+                  </button>
+                  <a
+                    href={`${API_BASE}/download-demo-pack-zip`}
+                    download="DEMO_TEST_FILES.zip"
+                    className="btn-secondary"
+                    style={{
+                      display: 'flex',
+                      alignItems: 'center',
+                      gap: '6px',
+                      fontSize: '13px',
+                      textDecoration: 'none',
+                      color: '#93c5fd',
+                      borderColor: 'rgba(59, 130, 246, 0.4)',
+                    }}
+                    title="Download individual sample PDF files in a ZIP"
+                  >
+                    <Download size={15} />
+                    Download Sample Files (ZIP)
+                  </a>
                 </div>
               </div>
 
-              {/* Upload Dropzone */}
+              {/* Upload Dropzone with Multi-File Batch Support */}
               <div className="dropzone" style={{ marginBottom: '24px' }}>
                 <input
                   type="file"
                   id="doc-upload-input"
+                  multiple
                   style={{ display: 'none' }}
-                  onChange={handleFileUpload}
+                  onChange={(e) => handleFileUpload(e.target.files, 'auto')}
                   accept=".pdf,.png,.jpg,.jpeg"
                 />
-                <label htmlFor="doc-upload-input" style={{ cursor: 'pointer' }}>
-                  <Upload size={32} color="var(--primary)" style={{ marginBottom: '8px' }} />
-                  <div style={{ fontWeight: 600 }}>Drop candidate PDF documents here or click to browse</div>
-                  <div style={{ fontSize: '12px', color: 'var(--text-muted)', marginTop: '4px' }}>
-                    Supports Aadhaar Card, Degree Certificate, Offer Letter, Bank Details
+                <label htmlFor="doc-upload-input" style={{ cursor: 'pointer', display: 'block' }}>
+                  <Upload size={34} color="var(--primary)" style={{ marginBottom: '8px' }} />
+                  <div style={{ fontWeight: 600, fontSize: '15px' }}>
+                    Drop ALL candidate PDF documents at once or click to browse
+                  </div>
+                  <div style={{ fontSize: '12.5px', color: 'var(--text-muted)', marginTop: '4px' }}>
+                    Select 1 to 4 files together. Automatically classifies Aadhaar Card, Degree Certificate, Offer Letter, and Bank Details via PyMuPDF OCR.
                   </div>
                 </label>
                 {uploadStatus && (
-                  <div style={{ marginTop: '12px', fontSize: '13px', color: '#a5b4fc' }}>
+                  <div
+                    style={{
+                      marginTop: '12px',
+                      fontSize: '13px',
+                      fontWeight: 600,
+                      color: '#a5b4fc',
+                      background: 'rgba(99, 102, 241, 0.12)',
+                      padding: '8px 14px',
+                      borderRadius: '6px',
+                      display: 'inline-block',
+                    }}
+                  >
                     {uploadStatus}
                   </div>
                 )}
@@ -809,62 +1237,196 @@ export default function App() {
               {/* Document Results Grid */}
               <div className="grid-2">
                 {[
-                  { id: 'aadhar_card', title: 'Aadhaar Identification' },
-                  { id: 'degree_certificate', title: 'Educational Degree Certificate' },
-                  { id: 'offer_letter_signed', title: 'Countersigned Offer Letter' },
-                  { id: 'bank_details', title: 'Banking Details & Cheque' },
+                  { id: 'aadhar_card', title: 'Aadhaar Identification', short: 'Aadhaar', sampleId: 'UID-4892' },
+                  { id: 'degree_certificate', title: 'Educational Degree Certificate', short: 'Degree', sampleId: 'DEG-2022' },
+                  { id: 'offer_letter_signed', title: 'Countersigned Offer Letter', short: 'Offer Letter', sampleId: 'APP-2024' },
+                  { id: 'bank_details', title: 'Banking Details & Cheque', short: 'Bank Cheque', sampleId: 'HDFC-5010' },
                 ].map((item) => {
                   const match = documents.find((d) => d.name === item.id || d.doc_name === item.id);
+                  const meta = match?.metadata_fields || {};
+                  const isOverridden = Boolean(meta.hr_manual_override);
+                  const hasDiscrepancy = Boolean(match?.issues && match.issues.some((i) => !i.startsWith('[HR Manual Override]')));
+                  const isVerified = Boolean(match?.readable && match?.name_match && (!hasDiscrepancy || isOverridden));
+                  const isMismatch = Boolean(match?.readable && (!match?.name_match || (hasDiscrepancy && !isOverridden)));
+
                   return (
-                    <div className="doc-card" key={item.id}>
-                      <div className="doc-card-header">
-                        <div style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
-                          <FileCheck size={18} color="var(--primary)" />
-                          <strong>{item.title}</strong>
+                    <div className="doc-card" key={item.id} style={{ display: 'flex', flexDirection: 'column', justifyContent: 'space-between' }}>
+                      <div>
+                        <div className="doc-card-header">
+                          <div style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
+                            <FileCheck size={18} color={isVerified ? '#10b981' : 'var(--primary)'} />
+                            <strong>{item.title}</strong>
+                          </div>
+                          <span className={`status-pill ${isVerified ? 'passed' : isMismatch ? 'warning' : 'pending'}`}>
+                            {isVerified ? (isOverridden ? 'Verified [HR Override]' : 'Verified [KYC Passed]') : isMismatch ? (match?.name_match ? 'KYC Discrepancy' : 'Name Mismatch') : 'Pending Upload'}
+                          </span>
                         </div>
-                        <span className={`status-pill ${match?.readable ? 'passed' : 'pending'}`}>
-                          {match?.readable ? 'Verified [OCR]' : 'Pending'}
-                        </span>
+
+                        <div style={{ fontSize: '12.5px', color: 'var(--text-muted)', lineHeight: '1.7' }}>
+                          <div>
+                            Document Type:{' '}
+                            <span style={{ color: 'white', fontWeight: 500 }}>
+                              {match?.type || match?.doc_type || 'KYC Document'}
+                            </span>
+                          </div>
+                          <div>
+                            Candidate Name Match:{' '}
+                            <span style={{ color: match?.name_match ? '#34d399' : match?.readable ? '#f87171' : 'var(--text-dim)', fontWeight: 600 }}>
+                              {match?.name_match ? 'Validated ✓' : match?.readable ? 'Mismatch ✗' : 'Awaiting Match'}
+                            </span>
+                          </div>
+                          <div>
+                            Extracted Name:{' '}
+                            <span style={{ color: 'white' }}>
+                              {match?.extracted_name || 'Not detected yet'}
+                            </span>
+                          </div>
+                          <div>
+                            Confidence Score:{' '}
+                            <span style={{ textTransform: 'capitalize', color: 'white' }}>
+                              {match?.confidence || 'High'}
+                            </span>
+                          </div>
+                          <div>
+                            Extraction Engine:{' '}
+                            <span style={{ color: '#c084fc' }}>
+                              {match?.llm_used ? 'Gemini AI' : 'PyMuPDF Rule-Based OCR'}
+                            </span>
+                          </div>
+                        </div>
+
+                        {/* Structural KYC Metadata Checklist */}
+                        {meta && Object.keys(meta).length > 0 && (
+                          <div
+                            style={{
+                              marginTop: '10px',
+                              padding: '8px 10px',
+                              background: 'rgba(255, 255, 255, 0.03)',
+                              borderRadius: '6px',
+                              border: '1px solid var(--border-color)',
+                              fontSize: '11.5px',
+                            }}
+                          >
+                            <div style={{ fontWeight: 600, color: '#93c5fd', marginBottom: '5px', display: 'flex', alignItems: 'center', justifyContent: 'space-between' }}>
+                              <span>Enterprise KYC Field Verification</span>
+                              {isOverridden && (
+                                <span style={{ color: '#10b981', fontSize: '10px', fontWeight: 600 }}>✓ HR Authorized</span>
+                              )}
+                            </div>
+                            <div style={{ display: 'grid', gridTemplateColumns: '1fr', gap: '3px', color: 'var(--text-muted)' }}>
+                              {item.id === 'aadhar_card' && (
+                                <>
+                                  <div>UIDAI No: <strong style={{ color: meta.aadhaar_number ? 'white' : '#f87171' }}>{meta.display_id || meta.aadhaar_number || 'Missing / Invalid'}</strong></div>
+                                  <div>Authority: <span style={{ color: meta.authority?.includes('Verified') ? '#86efac' : '#f87171' }}>{meta.authority || 'UIDAI Standard'}</span></div>
+                                  <div>DOB on Record: <span style={{ color: 'white' }}>{meta.dob || 'Verified'}</span></div>
+                                </>
+                              )}
+                              {item.id === 'degree_certificate' && (
+                                <>
+                                  <div>Institution: <strong style={{ color: meta.institution?.includes('Unrecognized') ? '#f87171' : 'white' }}>{meta.institution || 'Accredited University'}</strong></div>
+                                  <div>Qualification: <span style={{ color: '#86efac' }}>{meta.degree_title || 'Degree Validated'}</span></div>
+                                  <div>Graduation Year: <span style={{ color: 'white' }}>{meta.grad_year || 'Verified'}</span></div>
+                                  <div>Academic Standing: <span style={{ color: '#c084fc' }}>{meta.performance || 'Passed in Honors'}</span></div>
+                                </>
+                              )}
+                              {item.id === 'offer_letter_signed' && (
+                                <>
+                                  <div>Corporate Entity: <strong style={{ color: meta.employer?.includes('Unknown') ? '#f87171' : 'white' }}>{meta.employer || 'EnterpriseFlow AI'}</strong></div>
+                                  <div>Offered Role: <span style={{ color: '#86efac' }}>{meta.role || 'Designation Match'}</span></div>
+                                  <div>Signature Audit: <span style={{ color: meta.signature_status?.includes('Unsigned') ? '#f87171' : '#38bdf8' }}>{meta.signature_status || 'Digitally Signed'}</span></div>
+                                </>
+                              )}
+                              {item.id === 'bank_details' && (
+                                <>
+                                  <div>Scheduled Bank: <strong style={{ color: meta.bank_name?.includes('Unrecognized') ? '#f87171' : 'white' }}>{meta.bank_name || 'Commercial Bank'}</strong></div>
+                                  <div>Account No: <span style={{ color: meta.account_number?.includes('Not') ? '#f87171' : '#86efac' }}>{meta.account_number || 'Validated'}</span></div>
+                                  <div>RBI IFSC Code: <span style={{ color: meta.ifsc_code?.includes('Invalid') ? '#f87171' : '#38bdf8' }}>{meta.ifsc_code || 'Format Valid'}</span></div>
+                                </>
+                              )}
+                            </div>
+                          </div>
+                        )}
+
+                        {match?.issues && match.issues.length > 0 && (
+                          <div
+                            style={{
+                              background: isOverridden ? 'rgba(16, 185, 129, 0.1)' : 'var(--danger-bg)',
+                              color: isOverridden ? '#34d399' : '#f87171',
+                              padding: '8px',
+                              borderRadius: '6px',
+                              fontSize: '11px',
+                              marginTop: '8px',
+                            }}
+                          >
+                            {isOverridden ? 'HR Resolution:' : 'Verification Issues:'} {match.issues.join(', ')}
+                          </div>
+                        )}
                       </div>
 
-                      <div style={{ fontSize: '12.5px', color: 'var(--text-muted)' }}>
-                        <div>
-                          Document Type:{' '}
-                          <span style={{ color: 'white' }}>{match?.type || 'KYC Record'}</span>
-                        </div>
-                        <div>
-                          Name Match:{' '}
-                          <span style={{ color: match?.name_match ? '#34d399' : '#f87171' }}>
-                            {match?.name_match ? 'Validated' : 'Awaiting Match'}
-                          </span>
-                        </div>
-                        <div>
-                          Confidence Score:{' '}
-                          <span style={{ textTransform: 'capitalize', color: 'white' }}>
-                            {match?.confidence || 'High'}
-                          </span>
-                        </div>
-                        <div>
-                          Extraction Engine:{' '}
-                          <span style={{ color: '#c084fc' }}>
-                            {match?.llm_used ? 'Gemini AI' : 'Rule-Based OCR'}
-                          </span>
-                        </div>
-                      </div>
-
-                      {match?.issues && match.issues.length > 0 && (
-                        <div
+                      {/* Individual Card Upload Action & HR Override */}
+                      <div
+                        style={{
+                          marginTop: '14px',
+                          paddingTop: '10px',
+                          borderTop: '1px solid var(--card-border)',
+                          display: 'flex',
+                          justifyContent: 'space-between',
+                          alignItems: 'center',
+                          gap: '8px',
+                          flexWrap: 'wrap',
+                        }}
+                      >
+                        <label
+                          className="btn-secondary"
                           style={{
-                            background: 'var(--danger-bg)',
-                            color: '#f87171',
-                            padding: '8px',
-                            borderRadius: '6px',
-                            fontSize: '11px',
+                            padding: '6px 12px',
+                            fontSize: '12px',
+                            cursor: 'pointer',
+                            display: 'inline-flex',
+                            alignItems: 'center',
+                            gap: '6px',
                           }}
                         >
-                          Issues: {match.issues.join(', ')}
+                          <Upload size={13} />
+                          Upload {item.short}
+                          <input
+                            type="file"
+                            style={{ display: 'none' }}
+                            accept=".pdf,.png,.jpg,.jpeg"
+                            onChange={(e) => handleFileUpload(e.target.files, item.id)}
+                          />
+                        </label>
+
+                        <div style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
+                          {match && isMismatch && (
+                            <button
+                              type="button"
+                              onClick={() => handleHROverride(match.id)}
+                              className="btn-secondary"
+                              style={{
+                                padding: '5px 10px',
+                                fontSize: '11px',
+                                color: '#fbbf24',
+                                borderColor: 'rgba(251, 191, 36, 0.4)',
+                                background: 'rgba(251, 191, 36, 0.1)',
+                                display: 'inline-flex',
+                                alignItems: 'center',
+                                gap: '5px',
+                                cursor: 'pointer',
+                              }}
+                              title="HR officer manual sign-off override"
+                            >
+                              <ShieldAlert size={12} /> HR Sign-Off
+                            </button>
+                          )}
+
+                          {isVerified && (
+                            <span style={{ fontSize: '11px', color: '#10b981', display: 'flex', alignItems: 'center', gap: '4px' }}>
+                              <CheckCircle2 size={13} /> Ready
+                            </span>
+                          )}
                         </div>
-                      )}
+                      </div>
                     </div>
                   );
                 })}

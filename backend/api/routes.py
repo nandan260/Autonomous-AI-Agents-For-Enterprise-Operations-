@@ -6,6 +6,7 @@ from datetime import datetime
 from typing import Optional
 
 from fastapi import APIRouter, File, Form, HTTPException, UploadFile
+from fastapi.responses import FileResponse
 from sqlalchemy import select
 
 from ..agents.monitoring import TASKS, generate_progress_report
@@ -35,7 +36,14 @@ from ..schemas import (
     TrainingTaskUpdate,
 )
 from ..services.audit import log_activity
+from ..services.llm_service import extract_info_with_llm
 from ..services.mock_external_apis import MockEmailAPI, MockHRMS, SYNTHETIC_EMPLOYEES
+from ..services.ocr_service import (
+    detect_doc_category,
+    extract_text,
+    find_document,
+    generate_sample_pdf_pack,
+)
 
 router = APIRouter(prefix="/api")
 TASK_FLAGS = dict(TASKS)
@@ -107,7 +115,12 @@ def _save_graph_result(state: AgentState) -> None:
             return
 
         completed = all(bool(state.get(flag)) for _, flag in TASKS)
-        emp.onboarding_status = "completed" if completed else "in_progress"
+        if completed:
+            emp.onboarding_status = "completed"
+        elif state.get("is_paused"):
+            emp.onboarding_status = "paused_for_approval"
+        else:
+            emp.onboarding_status = "in_progress"
 
         tasks = session.scalars(
             select(OnboardingTask).where(OnboardingTask.employee_id == state["employee_id"])
@@ -115,7 +128,12 @@ def _save_graph_result(state: AgentState) -> None:
         for t in tasks:
             flag = TASK_FLAGS.get(t.task_name)
             if flag:
-                t.status = "completed" if state.get(flag) else "pending"
+                if state.get(flag):
+                    t.status = "completed"
+                elif state.get("is_paused") and state.get("active_checkpoint", {}).get("task") == t.task_name:
+                    t.status = "awaiting_approval"
+                elif t.status != "completed":
+                    t.status = "pending"
         session.commit()
     except Exception:
         session.rollback()
@@ -152,7 +170,7 @@ def _calc_progress(tasks: list[OnboardingTask]) -> int:
 # ── Onboarding Workflows ────────────────────────────────
 @router.post("/onboarding/start", response_model=OnboardingStatusResponse)
 def start_onboarding(payload: OnboardingStartRequest) -> OnboardingStatusResponse:
-    emp_id = payload.employee_id or f"EMP-2024-{str(uuid.uuid4().int)[:4]}"
+    emp_id = payload.employee_id or f"EMP-2024-{uuid.uuid4().hex[:6].upper()}"
     _ensure_employee(
         employee_id=emp_id,
         employee_name=payload.employee_name,
@@ -287,7 +305,7 @@ def list_employees() -> list[EmployeeResponse]:
 
 @router.post("/employees", response_model=EmployeeResponse)
 def create_employee(payload: EmployeeCreateRequest) -> EmployeeResponse:
-    emp_id = f"EMP-2024-{str(uuid.uuid4().int)[:4]}"
+    emp_id = f"EMP-2024-{uuid.uuid4().hex[:6].upper()}"
     emp = _ensure_employee(
         employee_id=emp_id,
         employee_name=payload.employee_name,
@@ -328,18 +346,30 @@ def get_employee_detail(employee_id: str):
         training = list(session.scalars(select(TrainingTaskRecord).where(TrainingTaskRecord.employee_id == employee_id)).all())
 
         return {
+            "employee_id": emp.employee_id,
+            "employee_name": emp.employee_name,
+            "email": emp.email,
+            "department": emp.department,
+            "role": emp.role,
+            "progress": _calc_progress(tasks),
             "employee": {
                 "id": emp.employee_id,
+                "employee_id": emp.employee_id,
                 "name": emp.employee_name,
+                "employee_name": emp.employee_name,
                 "email": emp.email,
                 "department": emp.department,
                 "role": emp.role,
                 "joining_date": emp.joining_date,
+                "salary": emp.salary,
                 "manager": emp.manager,
                 "buddy": emp.buddy,
                 "team": emp.team,
                 "desk": emp.desk,
+                "avatar": emp.avatar,
+                "avatar_color": emp.avatar_color,
                 "status": emp.onboarding_status,
+                "onboarding_status": emp.onboarding_status,
                 "progress": _calc_progress(tasks),
             },
             "tasks": [{"name": t.task_name, "status": t.status} for t in tasks],
@@ -379,32 +409,126 @@ def get_employee_detail(employee_id: str):
 # ── Documents Upload & Verification ─────────────────────
 @router.post("/documents/upload")
 async def upload_document(
-    file: UploadFile = File(...),
+    file: Optional[UploadFile] = File(None),
+    files: Optional[list[UploadFile]] = File(None),
     employee_id: Optional[str] = Form(None),
-    doc_type: Optional[str] = Form("identity"),
+    doc_type: Optional[str] = Form("auto"),
 ):
-    clean_name = os.path.basename(file.filename or f"doc_{uuid.uuid4().hex[:6]}.pdf")
-    dest_path = UPLOADS_DIR / clean_name
-    with open(dest_path, "wb") as buffer:
-        shutil.copyfileobj(file.file, buffer)
+    upload_list = []
+    if files:
+        upload_list.extend(files)
+    if file:
+        upload_list.append(file)
 
-    return {
-        "status": "success",
-        "filename": clean_name,
-        "saved_path": str(dest_path),
-        "size_bytes": os.path.getsize(dest_path),
-    }
+    if not upload_list:
+        raise HTTPException(status_code=400, detail="No files provided for upload")
 
+    emp_id = employee_id or "shared"
+    emp_folder = UPLOADS_DIR / emp_id
+    emp_folder.mkdir(parents=True, exist_ok=True)
 
-@router.get("/documents/{employee_id}")
-def get_employee_documents(employee_id: str):
     session = SessionLocal()
+    processed = []
     try:
-        records = list(session.scalars(select(DocumentRecord).where(DocumentRecord.employee_id == employee_id)).all())
-        return [
+        emp = session.get(Employee, emp_id) if emp_id != "shared" else None
+        emp_name = emp.employee_name if emp else "Candidate"
+
+        for up_file in upload_list:
+            if not up_file.filename:
+                continue
+            clean_name = os.path.basename(up_file.filename)
+            dest_path = emp_folder / clean_name
+            with open(dest_path, "wb") as buffer:
+                shutil.copyfileobj(up_file.file, buffer)
+
+            # OCR Text Extraction using PyMuPDF
+            raw_text = extract_text(str(dest_path))
+
+            # Determine category
+            if doc_type and doc_type != "auto" and len(upload_list) == 1:
+                cat = doc_type
+            else:
+                cat = detect_doc_category(clean_name, raw_text)
+
+            # Standardize filename to category for easy discovery
+            cat_dest = emp_folder / f"{cat}.pdf"
+            if str(dest_path) != str(cat_dest):
+                try:
+                    shutil.copyfile(dest_path, cat_dest)
+                except Exception:
+                    pass
+
+            # Information extraction & validation
+            extraction = extract_info_with_llm(raw_text, emp_name)
+            issues = extraction.get("issues") or []
+
+            # Upsert into DocumentRecord
+            existing_doc = session.scalars(
+                select(DocumentRecord).where(
+                    DocumentRecord.employee_id == emp_id,
+                    DocumentRecord.doc_name == cat,
+                )
+            ).first()
+
+            readable = len(raw_text.strip()) > 5
+            name_match = extraction.get("name_match", True)
+            confidence = extraction.get("confidence", "high")
+            detected_type = extraction.get("document_type", cat.replace("_", " ").title())
+
+            meta_json = json.dumps(extraction.get("metadata_fields", {}))
+
+            if not existing_doc:
+                session.add(
+                    DocumentRecord(
+                        employee_id=emp_id,
+                        doc_name=cat,
+                        doc_type=detected_type,
+                        readable=readable,
+                        extracted_name=extraction.get("extracted_name") or emp_name,
+                        name_match=name_match,
+                        confidence=confidence,
+                        llm_used=extraction.get("llm_used", False),
+                        issues=json.dumps(issues),
+                        metadata_fields=meta_json,
+                    )
+                )
+            else:
+                existing_doc.doc_type = detected_type
+                existing_doc.readable = readable
+                existing_doc.extracted_name = extraction.get("extracted_name") or emp_name
+                existing_doc.name_match = name_match
+                existing_doc.confidence = confidence
+                existing_doc.llm_used = extraction.get("llm_used", False)
+                existing_doc.issues = json.dumps(issues)
+                existing_doc.metadata_fields = meta_json
+
+            processed.append({
+                "filename": clean_name,
+                "category": cat,
+                "doc_type": detected_type,
+                "readable": readable,
+                "name_match": name_match,
+                "confidence": confidence,
+                "metadata_fields": extraction.get("metadata_fields", {}),
+            })
+
+            log_activity(
+                emp_id,
+                f"Document '{clean_name}' uploaded & verified as {detected_type} (Match: {name_match})",
+                "Document Verification",
+                "success" if name_match else "warning",
+            )
+
+        session.commit()
+
+        # Fetch full updated document list
+        records = list(session.scalars(select(DocumentRecord).where(DocumentRecord.employee_id == emp_id)).all())
+        updated_docs = [
             {
                 "id": r.id,
+                "name": r.doc_name,
                 "doc_name": r.doc_name,
+                "type": r.doc_type,
                 "doc_type": r.doc_type,
                 "readable": r.readable,
                 "extracted_name": r.extracted_name,
@@ -412,9 +536,203 @@ def get_employee_documents(employee_id: str):
                 "confidence": r.confidence,
                 "llm_used": r.llm_used,
                 "issues": json.loads(r.issues) if r.issues else [],
+                "metadata_fields": json.loads(r.metadata_fields) if r.metadata_fields else {},
             }
             for r in records
         ]
+
+        return {
+            "status": "success",
+            "message": f"Processed {len(processed)} document(s) successfully.",
+            "processed": processed,
+            "documents": updated_docs,
+        }
+    except Exception as e:
+        session.rollback()
+        raise HTTPException(status_code=500, detail=str(e))
+    finally:
+        session.close()
+
+
+@router.post("/documents/{employee_id}/generate-demo-pack")
+def generate_demo_documents(employee_id: str):
+    """Generate authentic, valid KYC PDFs for all 4 required document types for the candidate."""
+    session = SessionLocal()
+    try:
+        emp = session.get(Employee, employee_id)
+        if not emp:
+            raise HTTPException(status_code=404, detail="Employee not found")
+
+        emp_folder = UPLOADS_DIR / employee_id
+        pack = generate_sample_pdf_pack(emp.employee_name, str(emp_folder))
+
+        doc_type_titles = {
+            "aadhar_card": "Aadhaar Card",
+            "degree_certificate": "Degree Certificate",
+            "offer_letter_signed": "Countersigned Offer Letter",
+            "bank_details": "Bank Cheque & Statement",
+        }
+
+        for doc_key, pdf_path in pack.items():
+            raw_text = extract_text(pdf_path)
+            extraction = extract_info_with_llm(raw_text, emp.employee_name)
+            issues = extraction.get("issues") or []
+
+            existing_doc = session.scalars(
+                select(DocumentRecord).where(
+                    DocumentRecord.employee_id == employee_id,
+                    DocumentRecord.doc_name == doc_key,
+                )
+            ).first()
+
+            doc_type_title = doc_type_titles.get(doc_key, "KYC Document")
+            meta_json = json.dumps(extraction.get("metadata_fields", {}))
+
+            if not existing_doc:
+                session.add(
+                    DocumentRecord(
+                        employee_id=employee_id,
+                        doc_name=doc_key,
+                        doc_type=doc_type_title,
+                        readable=True,
+                        extracted_name=emp.employee_name,
+                        name_match=True,
+                        confidence="high",
+                        llm_used=extraction.get("llm_used", False),
+                        issues=json.dumps(issues),
+                        metadata_fields=meta_json,
+                    )
+                )
+            else:
+                existing_doc.doc_type = doc_type_title
+                existing_doc.readable = True
+                existing_doc.extracted_name = emp.employee_name
+                existing_doc.name_match = True
+                existing_doc.confidence = "high"
+                existing_doc.llm_used = extraction.get("llm_used", False)
+                existing_doc.issues = json.dumps(issues)
+                existing_doc.metadata_fields = meta_json
+
+        log_activity(
+            employee_id,
+            f"All 4 official KYC documents generated and verified for {emp.employee_name}",
+            "Document Verification",
+            "success",
+        )
+        session.commit()
+
+        records = list(session.scalars(select(DocumentRecord).where(DocumentRecord.employee_id == employee_id).order_by(DocumentRecord.id.desc())).all())
+        seen = set()
+        unique = []
+        for r in records:
+            if r.doc_name not in seen:
+                seen.add(r.doc_name)
+                unique.append(r)
+
+        return [
+            {
+                "id": r.id,
+                "name": r.doc_name,
+                "doc_name": r.doc_name,
+                "type": r.doc_type,
+                "doc_type": r.doc_type,
+                "readable": r.readable,
+                "extracted_name": r.extracted_name,
+                "name_match": r.name_match,
+                "confidence": r.confidence,
+                "llm_used": r.llm_used,
+                "issues": json.loads(r.issues) if r.issues else [],
+                "metadata_fields": json.loads(r.metadata_fields) if r.metadata_fields else {},
+            }
+            for r in unique
+        ]
+    finally:
+        session.close()
+
+
+@router.get("/documents/{employee_id}")
+def get_employee_documents(employee_id: str):
+    session = SessionLocal()
+    try:
+        records = list(session.scalars(select(DocumentRecord).where(DocumentRecord.employee_id == employee_id).order_by(DocumentRecord.id.desc())).all())
+        seen = set()
+        unique = []
+        for r in records:
+            if r.doc_name not in seen:
+                seen.add(r.doc_name)
+                unique.append(r)
+
+        return [
+            {
+                "id": r.id,
+                "name": r.doc_name,
+                "doc_name": r.doc_name,
+                "type": r.doc_type,
+                "doc_type": r.doc_type,
+                "readable": r.readable,
+                "extracted_name": r.extracted_name,
+                "name_match": r.name_match,
+                "confidence": r.confidence,
+                "llm_used": r.llm_used,
+                "issues": json.loads(r.issues) if r.issues else [],
+                "metadata_fields": json.loads(r.metadata_fields) if r.metadata_fields else {},
+            }
+            for r in unique
+        ]
+    finally:
+        session.close()
+
+
+@router.post("/documents/{doc_id}/hr-override")
+def hr_override_document(doc_id: int):
+    """Allow an authorized HR officer to manually override and sign off on a flagged document."""
+    session = SessionLocal()
+    try:
+        doc = session.get(DocumentRecord, doc_id)
+        if not doc:
+            raise HTTPException(status_code=404, detail="Document record not found")
+
+        doc.confidence = "high"
+        doc.name_match = True
+        doc.readable = True
+        override_note = f"[HR Manual Override]: Sign-off granted by HR Operations at {datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')}"
+        doc.issues = json.dumps([override_note])
+
+        meta = json.loads(doc.metadata_fields) if doc.metadata_fields else {}
+        meta["hr_manual_override"] = True
+        meta["hr_verified_at"] = datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')
+        doc.metadata_fields = json.dumps(meta)
+
+        log_activity(
+            doc.employee_id,
+            f"HR manual override and sign-off granted for document #{doc.id} ({doc.doc_type})",
+            "Document Verification",
+            "success",
+        )
+        session.commit()
+        return {
+            "status": "success",
+            "message": "Document manually verified and approved by HR sign-off.",
+            "document": {
+                "id": doc.id,
+                "name": doc.doc_name,
+                "doc_name": doc.doc_name,
+                "type": doc.doc_type,
+                "doc_type": doc.doc_type,
+                "readable": doc.readable,
+                "extracted_name": doc.extracted_name,
+                "name_match": doc.name_match,
+                "confidence": doc.confidence,
+                "llm_used": doc.llm_used,
+                "issues": json.loads(doc.issues) if doc.issues else [],
+                "metadata_fields": json.loads(doc.metadata_fields) if doc.metadata_fields else {},
+            },
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        session.rollback()
+        raise HTTPException(status_code=500, detail=str(e))
     finally:
         session.close()
 
@@ -466,6 +784,41 @@ def action_approval(approval_id: str, payload: ApprovalActionRequest):
         app.notes = payload.notes
         app.resolved_at = datetime.utcnow()
 
+        # If action is Approved, apply customized allocations
+        if payload.action == "Approved":
+            if app.approval_type == "IT Access":
+                asset = session.query(ITAssetRecord).filter(ITAssetRecord.employee_id == app.employee_id).first()
+                if asset:
+                    if payload.laptop_model:
+                        asset.laptop_model = payload.laptop_model
+                    if payload.asset_tag:
+                        asset.laptop_ticket_id = payload.asset_tag
+                        asset.master_ticket_id = payload.asset_tag
+                    if payload.software_licenses:
+                        asset.software_licenses = json.dumps(payload.software_licenses)
+                    asset.status = "provisioned"
+
+            elif app.approval_type == "Team Allocation":
+                emp_alloc = session.get(Employee, app.employee_id)
+                if emp_alloc:
+                    if payload.reporting_manager:
+                        emp_alloc.manager = payload.reporting_manager
+                    if payload.peer_buddy:
+                        emp_alloc.buddy = payload.peer_buddy
+                    if payload.assigned_team:
+                        emp_alloc.team = payload.assigned_team
+                    if payload.desk_location:
+                        emp_alloc.desk = payload.desk_location
+
+            elif app.approval_type == "Document Review":
+                # Manual HR override: mark flagged documents as accepted by HR officer
+                doc_records = list(session.scalars(select(DocumentRecord).where(DocumentRecord.employee_id == app.employee_id)).all())
+                for dr in doc_records:
+                    dr.readable = True
+                    dr.name_match = True
+                    dr.confidence = "high"
+                    dr.issues = json.dumps([])
+
         log_activity(
             app.employee_id,
             f"Human Gate [{app.approval_type}] resolved: {payload.action} by {app.approver}. Notes: {payload.notes or 'None'}",
@@ -473,7 +826,44 @@ def action_approval(approval_id: str, payload: ApprovalActionRequest):
             "success" if payload.action == "Approved" else "warning",
         )
         session.commit()
-        return {"status": "success", "approval_id": approval_id, "decision": payload.action}
+
+        # If action is Approved, automatically resume and advance the multi-agent pipeline!
+        resumed_result = None
+        if payload.action == "Approved":
+            emp = session.get(Employee, app.employee_id)
+            if emp:
+                resumed_state = run_onboarding(
+                    employee_id=emp.employee_id,
+                    employee_name=emp.employee_name,
+                    department=emp.department or "Engineering",
+                    designation=emp.role or "Software Engineer",
+                    joining_date=emp.joining_date or "",
+                )
+                _save_graph_result(resumed_state)
+                report = generate_progress_report(resumed_state)
+                is_p = resumed_state.get("is_paused", False)
+                resumed_result = {
+                    "status": "paused_for_approval" if is_p else "completed",
+                    "is_paused": is_p,
+                    "paused_reason": resumed_state.get("paused_reason", ""),
+                    "active_checkpoint": resumed_state.get("active_checkpoint", {}),
+                    "progress": report["progress"],
+                    "percent": report["percent"],
+                    "stages": [
+                        {"id": "doc_verification", "name": "Document Verification", "completed": resumed_state.get("documents_verified", False)},
+                        {"id": "it_provisioning", "name": "IT Provisioning", "completed": resumed_state.get("it_provisioned", False), "awaiting_approval": is_p and resumed_state.get("active_checkpoint", {}).get("task") == "it_provisioning"},
+                        {"id": "team_allocation", "name": "Team Allocation", "completed": resumed_state.get("team_allocated", False), "awaiting_approval": is_p and resumed_state.get("active_checkpoint", {}).get("task") == "team_allocation"},
+                        {"id": "training", "name": "Training & Orientation", "completed": resumed_state.get("training_assigned", False)},
+                    ],
+                    "audit_trail": resumed_state.get("audit_log", []),
+                }
+
+        return {
+            "status": "success",
+            "approval_id": approval_id,
+            "decision": payload.action,
+            "pipeline": resumed_result,
+        }
     finally:
         session.close()
 
@@ -538,7 +928,7 @@ def get_agents_status():
 # ── Full Pipeline Execution Endpoint ───────────────────
 @router.post("/pipeline/run-full")
 def run_full_pipeline(payload: OnboardingStartRequest):
-    emp_id = payload.employee_id or f"EMP-2024-{str(uuid.uuid4().int)[:4]}"
+    emp_id = payload.employee_id or f"EMP-2024-{uuid.uuid4().hex[:6].upper()}"
     _ensure_employee(
         employee_id=emp_id,
         employee_name=payload.employee_name,
@@ -560,10 +950,13 @@ def run_full_pipeline(payload: OnboardingStartRequest):
     session = SessionLocal()
     try:
         emp = session.get(Employee, emp_id)
-        tasks = list(session.scalars(select(OnboardingTask).where(OnboardingTask.employee_id == emp_id)).all())
         report = generate_progress_report(final_state)
+        is_p = final_state.get("is_paused", False)
         return {
-            "status": "completed",
+            "status": "paused_for_approval" if is_p else "completed",
+            "is_paused": is_p,
+            "paused_reason": final_state.get("paused_reason", ""),
+            "active_checkpoint": final_state.get("active_checkpoint", {}),
             "employee_id": emp_id,
             "employee_name": payload.employee_name,
             "department": payload.department,
@@ -571,8 +964,8 @@ def run_full_pipeline(payload: OnboardingStartRequest):
             "percent": report["percent"],
             "stages": [
                 {"id": "doc_verification", "name": "Document Verification", "completed": final_state.get("documents_verified", False)},
-                {"id": "it_provisioning", "name": "IT Provisioning", "completed": final_state.get("it_provisioned", False)},
-                {"id": "team_allocation", "name": "Team Allocation", "completed": final_state.get("team_allocated", False)},
+                {"id": "it_provisioning", "name": "IT Provisioning", "completed": final_state.get("it_provisioned", False), "awaiting_approval": is_p and final_state.get("active_checkpoint", {}).get("task") == "it_provisioning"},
+                {"id": "team_allocation", "name": "Team Allocation", "completed": final_state.get("team_allocated", False), "awaiting_approval": is_p and final_state.get("active_checkpoint", {}).get("task") == "team_allocation"},
                 {"id": "training", "name": "Training & Orientation", "completed": final_state.get("training_assigned", False)},
             ],
             "audit_trail": final_state.get("audit_log", []),
@@ -580,3 +973,31 @@ def run_full_pipeline(payload: OnboardingStartRequest):
         }
     finally:
         session.close()
+
+
+
+
+@router.get("/download-demo-pack-pdf")
+def download_demo_pack_pdf():
+    pdf_path = os.path.abspath("ALL_TEST_DOCUMENTS_SAMPLE_PACK.pdf")
+    if not os.path.exists(pdf_path):
+        raise HTTPException(status_code=404, detail="Demo pack PDF not found")
+    return FileResponse(
+        path=pdf_path,
+        media_type="application/pdf",
+        filename="ALL_TEST_DOCUMENTS_SAMPLE_PACK.pdf",
+    )
+
+
+@router.get("/download-demo-pack-zip")
+def download_demo_pack_zip():
+    zip_path = os.path.abspath("DEMO_TEST_FILES.zip")
+    if not os.path.exists(zip_path):
+        raise HTTPException(status_code=404, detail="Demo files ZIP not found")
+    return FileResponse(
+        path=zip_path,
+        media_type="application/zip",
+        filename="DEMO_TEST_FILES.zip",
+    )
+
+

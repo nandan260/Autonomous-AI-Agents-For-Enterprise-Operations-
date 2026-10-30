@@ -97,6 +97,17 @@ class ApprovalActionRequest(BaseModel):
     action: str  # "Approved" or "Rejected"
     approver: Optional[str] = "Admin Supervisor"
     notes: Optional[str] = ""
+    # Optional customized IT Provisioning parameters
+    laptop_model: Optional[str] = None
+    asset_tag: Optional[str] = None
+    privilege_tier: Optional[str] = None
+    software_licenses: Optional[list[str]] = None
+    # Optional customized Team Allocation parameters
+    reporting_manager: Optional[str] = None
+    peer_buddy: Optional[str] = None
+    assigned_team: Optional[str] = None
+    desk_location: Optional[str] = None
+    work_mode: Optional[str] = None
 
 
 class TrainingTaskUpdate(BaseModel):

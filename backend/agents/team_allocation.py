@@ -47,10 +47,6 @@ def team_allocation_agent(state: AgentState) -> AgentState:
     day1_tasks = MockHRMS.get_day1_tasks(department)
     audit_log.append(f"  ↳ Generated {len(day1_tasks)} tailored Day 1 tasks & blocked manager 1-on-1 slot")
 
-    # Human-in-the-Loop Gate for Manager confirmation
-    approval_id = f"APP-TM-{uid(4)}"
-    pending.append(approval_id)
-
     team_summary = {
         "team": team_name,
         "desk": desk_location,
@@ -61,6 +57,8 @@ def team_allocation_agent(state: AgentState) -> AgentState:
     }
 
     session = SessionLocal()
+    is_approved = False
+    approval_id = f"APP-TM-{uid(4)}"
     try:
         emp = session.get(Employee, employee_id)
         if emp:
@@ -69,26 +67,43 @@ def team_allocation_agent(state: AgentState) -> AgentState:
             emp.buddy = buddy_name
             emp.desk = desk_location
 
-        session.add(
-            ApprovalRequest(
-                approval_id=approval_id,
-                employee_id=employee_id,
-                agent="Team Allocation Agent",
-                approval_type="Team Allocation",
-                title=f"Manager Confirmation — {employee_name}",
-                description=(
-                    f"Reporting Manager ({manager_name}) confirmation required for {employee_name}'s "
-                    f"assignment to {team_name}, paired with {buddy_name}."
-                ),
-                checklist=json.dumps([
-                    "Employee role matches team requirements",
-                    "Department and team bandwidth confirmed",
-                    f"Buddy ({buddy_name}) availability verified",
-                    "Day 1 calendar 1-on-1 slot acknowledged",
-                ]),
-                status="Pending",
-            )
-        )
+        existing_approval = session.query(ApprovalRequest).filter(
+            ApprovalRequest.employee_id == employee_id,
+            ApprovalRequest.approval_type == "Team Allocation",
+        ).first()
+
+        if existing_approval and existing_approval.status == "Approved":
+            is_approved = True
+            approval_id = existing_approval.approval_id
+        elif state.get("team_approved", False):
+            is_approved = True
+            approval_id = existing_approval.approval_id if existing_approval else approval_id
+        else:
+            is_approved = False
+            if existing_approval:
+                approval_id = existing_approval.approval_id
+            else:
+                session.add(
+                    ApprovalRequest(
+                        approval_id=approval_id,
+                        employee_id=employee_id,
+                        agent="Team Allocation Agent",
+                        approval_type="Team Allocation",
+                        title=f"Manager Confirmation - {employee_name}",
+                        description=(
+                            f"Reporting Manager ({manager_name}) confirmation required for {employee_name}'s "
+                            f"assignment to {team_name}, paired with {buddy_name}."
+                        ),
+                        checklist=json.dumps([
+                            "Employee role matches team requirements",
+                            "Department and team bandwidth confirmed",
+                            f"Buddy ({buddy_name}) availability verified",
+                            "Day 1 calendar 1-on-1 slot acknowledged",
+                        ]),
+                        status="Pending",
+                    )
+                )
+
         session.commit()
     except Exception as e:
         session.rollback()
@@ -96,20 +111,58 @@ def team_allocation_agent(state: AgentState) -> AgentState:
     finally:
         session.close()
 
-    log_activity(
-        employee_id,
-        f"Manager confirmation gate raised ({approval_id}) for {manager_name}",
-        "Team Allocation",
-        "gate",
-    )
-    audit_log.append(f"⚠️ HUMAN GATE: Manager ({manager_name}) confirmation required [Request #{approval_id}]")
+    if not is_approved:
+        if approval_id not in pending:
+            pending.append(approval_id)
+        audit_log.append(f"[HITL CHECKPOINT PAUSE] Pipeline paused: Manager ({manager_name}) confirmation required [Request #{approval_id}]")
+        log_activity(
+            employee_id,
+            f"Pipeline paused at Team Gate ({approval_id}): Waiting for {manager_name} confirmation",
+            "Team Allocation",
+            "warning",
+        )
+        return {
+            **state,
+            "team_allocated": False,
+            "is_paused": True,
+            "paused_reason": f"Reporting Manager ({manager_name}) Confirmation Required",
+            "active_checkpoint": {
+                "approval_id": approval_id,
+                "agent": "Team Allocation Agent",
+                "approval_type": "Team Allocation",
+                "task": "team_allocation",
+                "title": f"Manager Confirmation - {employee_name}",
+                "description": f"Reporting Manager ({manager_name}) confirmation required for {employee_name}'s assignment to {team_name}, paired with {buddy_name}.",
+                "manager": manager_name,
+                "buddy": buddy_name,
+                "team": team_name,
+                "desk": desk_location,
+                "checklist": [
+                    "Employee role matches team requirements",
+                    "Department and team bandwidth confirmed",
+                    f"Buddy ({buddy_name}) availability verified",
+                    "Day 1 calendar 1-on-1 slot acknowledged",
+                ],
+            },
+            "team_info": team_summary,
+            "manager_name": manager_name,
+            "buddy_name": buddy_name,
+            "audit_log": audit_log,
+            "pending_approvals": pending,
+        }
 
+    # If approved, proceed cleanly!
+    audit_log.append(f"  ✅ [CONFIRMED] Reporting Manager ({manager_name}) confirmed team placement [Request #{approval_id}]")
+    log_activity(employee_id, f"Team allocation confirmed ({approval_id}) by {manager_name}", "Team Allocation", "success")
     return {
         **state,
         "team_allocated": True,
+        "is_paused": False,
+        "paused_reason": "",
+        "active_checkpoint": {},
         "team_info": team_summary,
         "manager_name": manager_name,
         "buddy_name": buddy_name,
         "audit_log": audit_log,
-        "pending_approvals": pending,
+        "pending_approvals": [p for p in pending if p != approval_id],
     }
