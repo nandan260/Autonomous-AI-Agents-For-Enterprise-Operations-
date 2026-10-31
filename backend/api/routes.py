@@ -989,15 +989,3 @@ def download_demo_pack_pdf():
     )
 
 
-@router.get("/download-demo-pack-zip")
-def download_demo_pack_zip():
-    zip_path = os.path.abspath("DEMO_TEST_FILES.zip")
-    if not os.path.exists(zip_path):
-        raise HTTPException(status_code=404, detail="Demo files ZIP not found")
-    return FileResponse(
-        path=zip_path,
-        media_type="application/zip",
-        filename="DEMO_TEST_FILES.zip",
-    )
-
-

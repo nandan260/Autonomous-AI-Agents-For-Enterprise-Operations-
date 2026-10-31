@@ -2,6 +2,9 @@ import os
 import json
 import re
 import threading
+from dotenv import load_dotenv
+
+load_dotenv()
 
 # Check if google.genai is available
 GEMINI_AVAILABLE = False
@@ -44,7 +47,7 @@ def extract_info_with_llm(document_text: str, employee_name: str) -> dict:
 
     thread = threading.Thread(target=call_gemini)
     thread.start()
-    thread.join(timeout=6)
+    thread.join(timeout=10)
 
     if thread.is_alive() or error_holder[0] or not result_holder[0]:
         return _extract_with_rules(document_text, employee_name)
@@ -69,7 +72,7 @@ Return ONLY a valid JSON object without markdown or code fences:
   "issues": []
 }}
 """
-    for model_name in ["gemini-2.5-flash", "gemini-1.5-flash", "gemini-flash-latest"]:
+    for model_name in ["gemini-3.5-flash-lite", "gemini-3.5-flash", "gemini-3.8-flash", "gemini-flash-latest"]:
         try:
             response = client.models.generate_content(
                 model=model_name,
@@ -80,6 +83,26 @@ Return ONLY a valid JSON object without markdown or code fences:
             text = re.sub(r"```\s*", "", text)
             data = json.loads(text)
             data["llm_used"] = True
+
+            # Enrich with structural KYC validation fields
+            text_lower = document_text.lower()
+            doc_type_lower = (data.get("document_type") or "").lower()
+            if "aadhaar" in doc_type_lower or "aadhar" in doc_type_lower or "unique identification" in text_lower:
+                m_fields, extra_issues = _verify_aadhaar_fields(document_text, text_lower, employee_name)
+            elif "degree" in doc_type_lower or "university" in text_lower or "institute" in text_lower:
+                m_fields, extra_issues = _verify_degree_fields(document_text, text_lower, employee_name)
+            elif "offer" in doc_type_lower or "appointment" in text_lower or "employment" in text_lower:
+                m_fields, extra_issues = _verify_offer_fields(document_text, text_lower, employee_name)
+            elif "bank" in doc_type_lower or "cheque" in text_lower or "ifsc" in text_lower:
+                m_fields, extra_issues = _verify_bank_fields(document_text, text_lower, employee_name)
+            else:
+                m_fields, extra_issues = {}, []
+
+            data["metadata_fields"] = m_fields
+            if extra_issues:
+                data.setdefault("issues", []).extend(extra_issues)
+                data["confidence"] = "medium"
+
             return data
         except Exception:
             continue

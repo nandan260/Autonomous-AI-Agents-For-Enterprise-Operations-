@@ -1176,24 +1176,6 @@ export default function App() {
                     <FileCheck size={15} />
                     ⚡ Auto-Generate All 4 KYC Docs
                   </button>
-                  <a
-                    href={`${API_BASE}/download-demo-pack-zip`}
-                    download="DEMO_TEST_FILES.zip"
-                    className="btn-secondary"
-                    style={{
-                      display: 'flex',
-                      alignItems: 'center',
-                      gap: '6px',
-                      fontSize: '13px',
-                      textDecoration: 'none',
-                      color: '#93c5fd',
-                      borderColor: 'rgba(59, 130, 246, 0.4)',
-                    }}
-                    title="Download individual sample PDF files in a ZIP"
-                  >
-                    <Download size={15} />
-                    Download Sample Files (ZIP)
-                  </a>
                 </div>
               </div>
 
